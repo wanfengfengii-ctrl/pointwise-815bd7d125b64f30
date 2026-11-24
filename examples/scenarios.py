@@ -64,13 +64,20 @@ def return_loop(retry_delay=0):
     return TrialExample(left, right, wiring, PortRef('A', 'a'))
 
 
-def register_station(center, source, station, route):
+def register_station(center, source, station, route, consuming=None):
     revision = save_revision(source, station, route.states, route.rows)
-    evidence = freeze(source, station, revision)
+    evidence = freeze(source, station, revision, consuming=consuming)
     return receive(center, evidence, station, revision)
 
 
 def register_example(center, left_source, right_source, example):
     left = register_station(center, left_source, 'A', example.left)
     right = register_station(center, right_source, 'B', example.right)
+    return fix_manifest(center, (left, right), example.connections)
+
+
+def register_declared_example(center, left_source, right_source, example,
+                              consuming_left=(), consuming_right=()):
+    left = register_station(center, left_source, 'A', example.left, consuming=consuming_left)
+    right = register_station(center, right_source, 'B', example.right, consuming=consuming_right)
     return fix_manifest(center, (left, right), example.connections)

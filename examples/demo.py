@@ -4,12 +4,13 @@ from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from analysis.scenarios import sign
-from examples.scenarios import TRIAL_ID, positive_chain, register_example, register_station, return_loop
+from analysis.scenarios import sign, sign_consumption
+from examples.scenarios import (TRIAL_ID, positive_chain, register_declared_example,
+                                register_example, register_station, return_loop)
 from handoff.center_store import CenterIntakeStore
 from handoff.manifest import fix_manifest
 from reports.comparison import compare_reports
-from reports.history import get_report
+from reports.history import get_consumption_report, get_report
 from reports.ledger import ReportLedger
 from routes.source_store import SourceStore
 
@@ -24,6 +25,15 @@ def _account(report):
     return {'first': [str(value) for value in account.first_by_tick], 'remaining': str(account.remaining)}
 
 
+def _consumption_account(report):
+    account = report.values.account
+    return {
+        'first': [[str(value) for value in row] for row in account.first_by_tick],
+        'exceeded': [str(value) for value in account.exceeded_by_tick],
+        'remaining': str(account.remaining),
+    }
+
+
 def _describe_report(case_id, inputs, expected, report, archived, oracle):
     actual = _account(report)
     _check_equal(actual, expected)
@@ -33,6 +43,18 @@ def _describe_report(case_id, inputs, expected, report, archived, oracle):
     _check_equal(downstream_actual, downstream_expected)
     _scenario(case_id, inputs, expected, actual, downstream_expected, downstream_actual,
               ['analysis/completion.py', 'reports/publish.py', 'reports/history.py'], oracle)
+
+
+def _describe_consumption(case_id, inputs, expected, report, archived, oracle):
+    actual = _consumption_account(report)
+    _check_equal(actual, expected)
+    _check_equal(archived, report)
+    downstream_expected = {'report_id': report.report_id, 'intake_ids': list(report.values.receipt_ids)}
+    downstream_actual = {'report_id': archived.receipt.report_id, 'intake_ids': list(archived.receipt.receipt_ids)}
+    _check_equal(downstream_actual, downstream_expected)
+    _scenario(case_id, inputs, expected, actual, downstream_expected, downstream_actual,
+              ['station/consumption.py', 'analysis/consumption.py', 'reports/publish.py',
+               'reports/history.py'], oracle)
 
 
 def _scenario(case_id, inputs, expected, actual, downstream_expected, downstream_actual, code_paths, oracle):
@@ -58,10 +80,31 @@ def main():
                 right.initialize()
                 chain_manifest = register_example(center, left, right, chain)
                 old_manifest = register_example(center, left, right, original)
+                plain_manifest = register_declared_example(center, left, right, chain)
+                declared_manifest = register_declared_example(
+                    center, left, right, chain, consuming_left=('a-send',), consuming_right=('b-check',))
+                loop_manifest = register_declared_example(
+                    center, left, right, original, consuming_left=('a-retry',))
             left_path.rename(left_off)
             right_path.rename(right_off)
             positive_report = sign(center, chain_manifest.manifest_id, chain.start, 3)
             old_report = sign(center, old_manifest.manifest_id, original.start, 1)
+
+            plain_completion = sign(center, plain_manifest.manifest_id, chain.start, 3)
+            declared_completion = sign(center, declared_manifest.manifest_id, chain.start, 3)
+            _check_equal(_account(declared_completion), _account(plain_completion))
+            plain_quota = sign_consumption(center, plain_manifest.manifest_id, chain.start, 3, 0)
+            declared_quota0 = sign_consumption(center, declared_manifest.manifest_id, chain.start, 3, 0)
+            declared_quota1 = sign_consumption(center, declared_manifest.manifest_id, chain.start, 3, 1)
+            loop_completion = sign(center, loop_manifest.manifest_id, original.start, 1)
+            loop_quota1 = sign_consumption(center, loop_manifest.manifest_id, original.start, 1, 1)
+            refused_error = None
+            try:
+                sign_consumption(center, old_manifest.manifest_id, original.start, 1, 1)
+            except ValueError as error:
+                refused_error = error
+            if refused_error is None:
+                raise AssertionError('expected the undeclared evidence to be refused')
 
             left_off.rename(left_path)
             with closing(SourceStore(left_path)) as left:
@@ -103,6 +146,51 @@ def main():
                       expected, actual, ['0', '-1/6'], delta,
                       ['station/freezing.py', 'analysis/completion.py', 'reports/comparison.py'],
                       'The delayed retry misses the first deadline. Subtract 2/3 from 1/2 at tick one.')
+
+            _check_equal(_account(plain_completion), {'first': ['0', '0', '0', '1'], 'remaining': '0'})
+            _describe_consumption(
+                'v8', {'lag_a': 1, 'lag_b': 2, 'horizon': 3, 'quota': 0, 'consuming': []},
+                {'first': [['0'], ['0'], ['0'], ['1']], 'exceeded': ['0', '0', '0', '0'],
+                 'remaining': '0'},
+                plain_quota, get_consumption_report(ledger, plain_quota.report_id),
+                'No row consumes, so the zero quota never binds and the chain completes at tick three.')
+            _describe_consumption(
+                'v9', {'lag_a': 1, 'lag_b': 2, 'horizon': 3, 'quota': 0,
+                       'consuming': ['a-send', 'b-check']},
+                {'first': [['0'], ['0'], ['0'], ['0']], 'exceeded': ['0', '1', '0', '0'],
+                 'remaining': '0'},
+                declared_quota0, get_consumption_report(ledger, declared_quota0.report_id),
+                'Same completion rate as v8, but the first declared row spends a sample at tick '
+                'one, past the zero quota.')
+            _describe_consumption(
+                'v10', {'lag_a': 1, 'lag_b': 2, 'horizon': 3, 'quota': 1,
+                        'consuming': ['a-send', 'b-check']},
+                {'first': [['0', '0'], ['0', '0'], ['0', '0'], ['0', '0']],
+                 'exceeded': ['0', '0', '0', '1'], 'remaining': '0'},
+                declared_quota1, get_consumption_report(ledger, declared_quota1.report_id),
+                'The second sample completes at tick three together with the inspection; the '
+                'overrun is settled before the same-tick completion.')
+            _check_equal(_account(loop_completion), {'first': ['0', '2/3'], 'remaining': '1/3'})
+            _describe_consumption(
+                'v11', {'retry_delay': 0, 'direct': '1/2', 'retry': '1/4', 'closed': '1/4',
+                        'horizon': 1, 'quota': 1, 'consuming': ['a-retry']},
+                {'first': [['0', '0'], ['1/2', '1/8']], 'exceeded': ['1/16', '0'],
+                 'remaining': '5/16'},
+                loop_quota1, get_consumption_report(ledger, loop_quota1.report_id),
+                'Each zero-delay return spends one more sample: completions use 0 or 1 of the '
+                'quota, a second retry overruns at tick zero, and the closed branch plus a '
+                'stranded retry leave 5/16 unsettled.')
+            expected_refusal = {'error': 'ValueError',
+                                'completion': {'first': ['0', '2/3'], 'remaining': '1/3'}}
+            actual_refusal = {'error': type(refused_error).__name__, 'completion': _account(old)}
+            _check_equal(actual_refusal, expected_refusal)
+            _scenario('v12', {'horizon': 1, 'quota': 1, 'declaration': 'missing'},
+                      expected_refusal, actual_refusal,
+                      {'report_id': old_report.report_id, 'intake_ids': list(old_report.values.receipt_ids)},
+                      {'report_id': old.report_id, 'intake_ids': list(old.receipt.receipt_ids)},
+                      ['analysis/scenarios.py', 'analysis/consumption.py'],
+                      'The undeclared station evidence still signs the completion account, but '
+                      'carries no fixed consumable declaration.')
 
 
 if __name__ == '__main__':

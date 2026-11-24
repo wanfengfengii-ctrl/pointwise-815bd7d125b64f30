@@ -6,3 +6,10 @@ def get_report(ledger: ReportLedger, report_id):
     if pair is None:
         raise LookupError(f'unknown signed report: {report_id}')
     return pair
+
+
+def get_consumption_report(ledger: ReportLedger, report_id):
+    pair = ledger.read_consumption_pair(report_id)
+    if pair is None:
+        raise LookupError(f'unknown signed consumption report: {report_id}')
+    return pair

@@ -3,6 +3,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from analysis.consumption_values import ConsumptionReportValues, decode_consumption_values, encode_consumption_values
 from analysis.report_values import ReportValues, decode_report_values, encode_report_values
 from reports.receipts import FirstReceipt
 from station.origin import make_origin
@@ -13,6 +14,26 @@ class SignedReport:
     report_id: int
     values: ReportValues
     receipt: FirstReceipt
+
+
+@dataclass(frozen=True)
+class SignedConsumptionReport:
+    report_id: int
+    values: ConsumptionReportValues
+    receipt: FirstReceipt
+
+
+def _receipt_payload(receipt):
+    return json.dumps({
+        'receipts': list(receipt.receipt_ids),
+        'origins': [[origin.station, origin.revision_id] for origin in receipt.origins],
+    }, ensure_ascii=False, separators=(',', ':'))
+
+
+def _read_receipt(report_id, text):
+    stored = json.loads(text)
+    return FirstReceipt(report_id, tuple(stored['receipts']),
+                        tuple(make_origin(*origin) for origin in stored['origins']))
 
 
 class ReportLedger:
@@ -30,6 +51,14 @@ class ReportLedger:
             );
             CREATE TABLE IF NOT EXISTS first_receipts (
                 report_id INTEGER PRIMARY KEY REFERENCES completion_reports(id),
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS consumption_reports (
+                id INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS consumption_receipts (
+                report_id INTEGER PRIMARY KEY REFERENCES consumption_reports(id),
                 payload TEXT NOT NULL
             );
         ''')
@@ -58,18 +87,33 @@ class ReportLedger:
     def insert_receipt(self, receipt):
         if not self.connection.in_transaction:
             raise sqlite3.ProgrammingError('start a ledger transaction before publishing')
-        payload = {
-            'receipts': list(receipt.receipt_ids),
-            'origins': [[origin.station, origin.revision_id] for origin in receipt.origins],
-        }
         self.connection.execute(
             'INSERT INTO first_receipts (report_id, payload) VALUES (?, ?)',
-            (receipt.report_id, json.dumps(payload, ensure_ascii=False, separators=(',', ':'))),
+            (receipt.report_id, _receipt_payload(receipt)),
         )
 
-    def read_pair(self, report_id):
+    def insert_consumption(self, values):
+        if not self.connection.in_transaction:
+            raise sqlite3.ProgrammingError('start a ledger transaction before publishing')
+        cursor = self.connection.execute(
+            'INSERT INTO consumption_reports (payload) VALUES (?)', (encode_consumption_values(values),)
+        )
+        return cursor.lastrowid
+
+    def insert_consumption_receipt(self, receipt):
+        if not self.connection.in_transaction:
+            raise sqlite3.ProgrammingError('start a ledger transaction before publishing')
+        self.connection.execute(
+            'INSERT INTO consumption_receipts (report_id, payload) VALUES (?, ?)',
+            (receipt.report_id, _receipt_payload(receipt)),
+        )
+
+    def _check_report_id(self, report_id):
         if type(report_id) is not int or not 0 < report_id < 2**63:
             raise ValueError('invalid report number')
+
+    def read_pair(self, report_id):
+        self._check_report_id(report_id)
         row = self.connection.execute(
             '''SELECT report.payload, receipt.payload
                FROM completion_reports AS report
@@ -80,7 +124,20 @@ class ReportLedger:
         if row is None:
             return None
         values_text, receipt_text = row
-        stored_receipt = json.loads(receipt_text)
-        receipt = FirstReceipt(report_id, tuple(stored_receipt['receipts']),
-                               tuple(make_origin(*origin) for origin in stored_receipt['origins']))
-        return SignedReport(report_id, decode_report_values(values_text), receipt)
+        return SignedReport(report_id, decode_report_values(values_text),
+                            _read_receipt(report_id, receipt_text))
+
+    def read_consumption_pair(self, report_id):
+        self._check_report_id(report_id)
+        row = self.connection.execute(
+            '''SELECT report.payload, receipt.payload
+               FROM consumption_reports AS report
+               JOIN consumption_receipts AS receipt ON receipt.report_id = report.id
+               WHERE report.id = ?''',
+            (report_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        values_text, receipt_text = row
+        return SignedConsumptionReport(report_id, decode_consumption_values(values_text),
+                                       _read_receipt(report_id, receipt_text))
